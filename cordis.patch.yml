@@ -1,0 +1,6 @@
+# dsh-undo bundle layer: expose the plugin row under the package name so
+# `dsh plugin --profile <name> add dsh-undo` activates it.
+
+- insert:
+    - id: undo
+      name: dsh-undo
