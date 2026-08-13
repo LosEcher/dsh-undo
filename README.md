@@ -1,5 +1,7 @@
 # dsh-undo
 
+English | [中文](README.zh.md)
+
 > [!WARNING]
 > **Forward-looking preview: this release is not usable with any currently published DeepSeek Harness version.** It depends on unreleased Harness support for durable `surface/rewind` / `surface/restore` events and the `conversation.chat.user-actions` WebUI slot. Installing it today will make `/undo` fail closed with an upgrade message. Publish this package only to preview and coordinate the future integration; do not present it as production-ready until the matching Harness release exists.
 
