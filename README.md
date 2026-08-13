@@ -1,28 +1,48 @@
 # dsh-undo
 
-Context undo/redo plugin for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`), inspired by the undo/redo experience in coding agents like [opencode](https://github.com/anomalyco/opencode).
+> [!WARNING]
+> **Forward-looking preview: this release is not usable with any currently published DeepSeek Harness version.** It depends on unreleased Harness support for durable `surface/rewind` / `surface/restore` events and the `conversation.chat.user-actions` WebUI slot. Installing it today will make `/undo` fail closed with an upgrade message. Publish this package only to preview and coordinate the future integration; do not present it as production-ready until the matching Harness release exists.
 
-The plugin adds two model-facing tools to every root agent:
+Durable, multi-level undo/redo for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`). It rewinds model context by real user turn and restores workspace files changed by tools in that turn.
 
-- **`undo`** — rolls the model context back to the end of the last completed step. Every assistant message and tool result of that step is shadowed out of the visible context; the durable session log keeps every rolled-back event, so nothing is lost.
-- **`redo`** — restores the messages the most recent `undo` removed, re-adding them to the context exactly as they were.
+The commands are handled locally and are never sent to the model:
 
-## How it works
+- **`/undo`** rewinds the latest visible real user message and every surface message after it.
+- **`/undo <user-seq>`** rewinds from a specific visible user message, including all later turns.
+- **`/redo`** restores the latest active rewind. Repeated undo and redo operations use LIFO order.
 
-The session log is append-only, so `undo` never deletes events. Instead it appends one **empty-content `assistant/message`** whose surface `replace` op shadows the target step's model-visible nodes. Empty assistant content derives to no message, so the context the model sees is exactly the pre-step context, while the log remains a complete, replayable, reversible history. `redo` re-appends fresh copies of the shadowed events as ordinary surface appends (with re-minted message identities; tool results keep their call correlation, so transcript tool-call → tool-result adjacency is preserved).
+The WebUI client contributes an undo action to finalized real-user message bubbles. The action invokes `/undo <user-seq>`; the Host validates that the addressed message is still a legal rewind target.
 
-Design notes:
+## How It Works
 
-- **Undo unit is one completed step** (the newest step/end whose step still has visible messages). Repeated `undo` calls walk back one step at a time.
-- **User messages are never rolled back** — a user prompt stays in context; only the assistant work done in response can be undone.
-- **Redo is invalidated by new user input** — any new user-role message clears the redo stack (standard undo/redo semantics). The undo/redo tools' own calls, results, and redo copies do not invalidate it.
-- **Durability** — every operation flushes through the shared session durability barrier (`ctx.sessions.flush`) before reporting success; if persistence cannot be proven, the tool returns `persistence_uncertain` rather than lying.
-- **Undo history is process-local** — like a browser's undo stack, the redo stack is in memory. Restarting the process keeps the log consistent (markers stay shadowed, copies stay restored) but clears the redo stack.
-- **Scope** — the tools are installed only for root agents published after the plugin loads (subagents and pre-existing sessions are not retrofitted).
+Harness sessions remain append-only. Undo appends a dedicated `surface/rewind` control event for the exact current surface suffix; redo appends `surface/restore` for the newest active rewind. The original message nodes, message IDs, tool-call correlations, and log events are retained. Session replay reconstructs the same visible surface and redo stack after restart.
+
+Before and after each top-level tool execution, the plugin records a workspace tree using an isolated hidden Git directory under `~/.dsh/dsh-undo/snapshots/`. It does not create commits, switch branches, or modify the repository's own Git index. Undo restores only files touched by tools in the selected user turns; redo restores the pre-undo tree. Patch and redo metadata are stored per session so file redo can survive a Host restart.
+
+Workspace tracking includes tracked files and untracked files up to 2 MiB. Files ignored by the repository and larger untracked files are left untouched. A small two-phase journal reconciles interrupted file operations against the durable active-rewind stack after restart. If the session has no Git workspace, context undo/redo still works and the command reports that file restoration is unavailable.
+
+Background jobs returned by top-level tools are associated with their user turn. Undo requests termination for jobs started in the removed turns. Redo restores context and files but cannot restart terminated processes.
+
+## Requirements
+
+This plugin requires a Harness version that supports:
+
+- Durable `surface/rewind` and `surface/restore` session events.
+- The `conversation.chat.user-actions` client slot for the WebUI action.
+
+Older Harness releases fail closed: `/undo` reports that a compatible Harness upgrade is required instead of writing replacement assistant messages or copying transcript events.
+
+## Limits
+
+- File restoration is limited to the detected Git workspace. It never restores files outside that root.
+- Network requests, database writes, remote API calls, already-exited processes, and other external effects cannot be undone.
+- Background jobs started through nested tool dispatches or child agents may not be associated with the root user turn.
+- Undo signals recorded top-level background jobs but does not wait indefinitely for process exit.
+- New ordinary surface output invalidates active redo history according to Harness surface semantics.
 
 ## Install
 
-The package is a [dsh bundle](https://deepseek-harness.github.io/deepseek-harness/develop/basic/publish/): `package.json` declares `dsh.bundle` pointing at `cordis.patch.yml`, which activates the plugin row.
+The package is a [dsh bundle](https://deepseek-harness.github.io/deepseek-harness/develop/basic/publish/). `package.json` points `dsh.bundle` to `cordis.patch.yml`, which activates the Host plugin, and exposes a WebUI Client bundle.
 
 From npm:
 
@@ -30,19 +50,17 @@ From npm:
 dsh plugin --profile demo add dsh-undo
 ```
 
-From git (source checkout — the `prepare` script builds `lib/` on install; authorize the build in the profile's `pnpm-workspace.yaml` first):
+From git (the `prepare` script builds `lib/` during installation; authorize the build in the profile's `pnpm-workspace.yaml` first):
 
 ```sh
 dsh plugin --profile demo add github:LingLambda/dsh-undo#<sha>
 ```
 
-For local development against a source checkout of deepseek-harness, load the plugin directly as an overlay:
+For local development against a Harness checkout, load the Host source with an overlay:
 
 ```sh
 pnpm dsh web --patch ./cordis.patch.yml --patch /absolute/path/to/dsh-undo/overlay.yml
 ```
-
-where `overlay.yml` references the source entry:
 
 ```yaml
 - insert:
@@ -52,21 +70,21 @@ where `overlay.yml` references the source entry:
 
 ## Usage
 
-The model calls `undo` when you ask it to undo, rewind, or roll back its latest action, and `redo` to restore what was undone:
-
+```text
+/undo
+/undo 42
+/redo
 ```
-> That edit was wrong. Undo it and try a different approach.
-```
 
-Each call's result reports what happened (`rolled_back` with the shadowed count and marker seq, `restored`, `nothing_to_undo`, `nothing_to_redo`, or an error).
+Use `/undo` for the latest user turn, the action on an older user bubble to rewind from that point, and `/redo` to restore the most recent rewind.
 
 ## Develop
 
 ```sh
-yarn install
-yarn typecheck
-yarn test
-yarn build
+corepack yarn install
+corepack yarn typecheck
+corepack yarn test
+corepack yarn build
 ```
 
 ## License

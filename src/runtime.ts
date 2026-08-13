@@ -1,160 +1,153 @@
-/**
- * Per-agent undo/redo runtime: owns the process-local redo stack and applies
- * rollback/restore operations to the agent's session log.
- *
- * The undo history is process-local by design (like a browser's undo stack):
- * the LOG stays consistent across restarts (markers remain shadowed, copies
- * remain restored), but the redo stack itself is not persisted.
- *
- * @module dsh-undo
- */
+/** Per-agent durable surface undo/redo operations. */
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { CommandResult } from '@deepseek-ai/dsh-commands'
 import {
-  appendRedoCopies,
-  appendUndoMarker,
+  activeRewindSeqs,
+  appendSurfaceRestore,
+  appendSurfaceRewind,
   computeUndoRange,
-  type RedoEntry,
+  lastVisibleText,
+  supportsSurfaceRewind,
 } from './domain.ts'
 import { flushUndoPersistence } from './persistence.ts'
-import {
-  INTERNAL_ERROR_MESSAGE,
-  PERSISTENCE_UNCERTAIN_MESSAGE,
-  type RedoResult,
-  type UndoResult,
-} from './types.ts'
-/** Stable model account for a completed rollback. */
-function rolledBackNote(range: { readonly turn: number; readonly step: number }, count: number): string {
-  return `Rolled back ${count} message(s) from turn ${range.turn}, step ${range.step}. `
-    + 'The context now ends before that step; the rolled-back messages stay in the durable log and can be restored with redo.'
-}
+import type { WorkspaceUndoTracker } from './workspace.ts'
 
-/** Stable model account for a completed restore. */
-function restoredNote(count: number): string {
-  return `Restored ${count} message(s) that the most recent undo had removed.`
-}
+export const PERSISTENCE_UNCERTAIN_TEXT =
+  '撤销/重做已应用到会话，但持久化尚未确认；请稍后检查会话记录。'
+export const INTERNAL_ERROR_TEXT = '撤销/重做操作更新会话记录失败。'
+export const CANCELLED_TEXT = '操作已取消。'
+export const BUSY_TEXT = '当前会话正在处理其他操作；请在其完成后重试。'
+export const UNSUPPORTED_TEXT =
+  '当前 Harness 不支持安全的会话回退；请升级到包含 surface rewind/restore 的版本。'
 
-/**
- * One live root agent's undo/redo state and operations. Registered through the
- * agent's scoped context; disposed together with the agent.
- */
+/** One live root agent's undo/redo operations. */
 export class UndoRuntime {
-  /** Redoable rollbacks in undo order (LIFO). Not persisted. */
-  readonly redoStack: RedoEntry[] = []
-
   constructor(
     private readonly rootCtx: Context,
     private readonly agent: Agent,
+    private readonly workspace?: WorkspaceUndoTracker,
   ) {}
 
-  /**
-   * Model-source identity recorded on rewind markers. The agent's own route
-   * when configured; a stable placeholder otherwise (markers are invisible to
-   * the model, so the identity is purely archival).
-   */
-  private markerSource(): { provider: string; model: string } {
-    return {
-      provider: this.agent.options.provider ?? 'dsh-undo',
-      model: this.agent.options.model ?? 'undo-marker',
+  async undo(signal: AbortSignal, targetUserSeq?: number): Promise<CommandResult> {
+    if (signal.aborted) return { kind: 'error', text: CANCELLED_TEXT }
+    try {
+      return await this.agent.runMaintenance(maintenanceSignal =>
+        this.undoIdle(signal, maintenanceSignal, targetUserSeq))
+    } catch (error: unknown) {
+      this.rootCtx.logger.warn(`undo: maintenance failed: ${error instanceof Error ? error.message : String(error)}`)
+      return { kind: 'error', text: BUSY_TEXT }
     }
   }
 
-  /**
-   * Invalidate the redo stack when a new user-role message enters the surface:
-   * ordinary undo/redo semantics say fresh input makes undone work unreachable.
-   * Assistant/tool appends do NOT invalidate (the undo/redo tools' own calls,
-   * results, and redo copies all append those event types).
-   * @returns the exact disposer.
-   */
-  installInvalidation(): () => void {
-    return this.agent.ctx.on('session/event', (_session, event) => {
-      if (event.type === 'user/message' && event.surfaceOp === 'append') {
-        this.redoStack.length = 0
+  private async undoIdle(
+    signal: AbortSignal,
+    maintenanceSignal: AbortSignal,
+    targetUserSeq?: number,
+  ): Promise<CommandResult> {
+    if (signal.aborted || maintenanceSignal.aborted) return { kind: 'error', text: CANCELLED_TEXT }
+    if (!supportsSurfaceRewind(this.agent.session)) return { kind: 'error', text: UNSUPPORTED_TEXT }
+    try {
+      await flushUndoPersistence(this.rootCtx, this.agent.session)
+      await this.workspace?.reconcile()
+    } catch {
+      return { kind: 'error', text: PERSISTENCE_UNCERTAIN_TEXT }
+    }
+    const range = computeUndoRange(this.agent.session, targetUserSeq)
+    if (range === undefined) {
+      return {
+        kind: 'success',
+        text: targetUserSeq === undefined
+          ? '没有可撤销的用户输入。'
+          : `无法撤销用户消息 ${targetUserSeq}：它不在当前模型上下文中。`,
       }
-    })
-  }
-
-  /**
-   * Roll the context back to the end of the last completed step.
-   * @param signal - caller cancellation; observed at operation boundaries.
-   * @returns the closed canonical value.
-   */
-  async undo(signal: AbortSignal): Promise<UndoResult> {
-    if (signal.aborted) {
-      return { status: 'internal_error', message: 'The undo call was cancelled before it ran.' }
     }
+    if (signal.aborted || maintenanceSignal.aborted) return { kind: 'error', text: CANCELLED_TEXT }
+    let workspaceResult: Awaited<ReturnType<WorkspaceUndoTracker['undo']>> | undefined
+    let killedJobs = 0
+    const rewindSeq = this.agent.session.seq
     try {
-      await flushUndoPersistence(this.rootCtx, this.agent.session)
-    } catch {
-      return { status: 'persistence_uncertain', message: PERSISTENCE_UNCERTAIN_MESSAGE }
-    }
-    const range = computeUndoRange(this.agent.session)
-    if (range === undefined) return { status: 'nothing_to_undo' }
-    if (signal.aborted) {
-      return { status: 'internal_error', message: 'The undo call was cancelled before it committed.' }
-    }
-    let markerSeq: number
-    try {
-      const { provider, model } = this.markerSource()
-      markerSeq = appendUndoMarker(this.agent.session, range.shadowedSeqs, provider, model).seq
+      const userSeqs = range.shadowedSeqs.filter((seq) => {
+        const event = this.agent.session.events[seq]
+        return event?.type === 'user/message' && event.data.source.kind === 'user'
+      })
+      workspaceResult = await this.workspace?.undo(userSeqs, rewindSeq)
+      appendSurfaceRewind(this.agent.session, range)
+      killedJobs = this.workspace?.killJobs(userSeqs) ?? 0
     } catch (error: unknown) {
-      this.rootCtx.logger.warn(`undo: marker append failed: ${error instanceof Error ? error.message : String(error)}`)
-      return { status: 'internal_error', message: INTERNAL_ERROR_MESSAGE }
+      try {
+        await this.workspace?.rollbackUndo(rewindSeq)
+      } catch (rollbackError: unknown) {
+        this.rootCtx.logger.warn(`undo: workspace compensation failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`)
+      }
+      this.rootCtx.logger.warn(`undo: surface rewind failed: ${error instanceof Error ? error.message : String(error)}`)
+      return { kind: 'error', text: INTERNAL_ERROR_TEXT }
     }
-    // The stack mirrors the in-session state (the marker is already applied);
-    // the durability barrier below only decides how confidently we report it.
-    this.redoStack.push({ shadowedSeqs: [...range.shadowedSeqs] })
     try {
       await flushUndoPersistence(this.rootCtx, this.agent.session)
+      await this.workspace?.commitUndo(rewindSeq)
     } catch {
-      return { status: 'persistence_uncertain', message: PERSISTENCE_UNCERTAIN_MESSAGE }
+      return { kind: 'error', text: PERSISTENCE_UNCERTAIN_TEXT }
     }
+    const target = lastVisibleText(this.agent.session)
+    const workspaceText = workspaceResult?.files === undefined || workspaceResult.files === 0
+      ? ''
+      : `，并恢复 ${workspaceResult.files} 个工作树文件`
+    const jobsText = killedJobs === 0 ? '' : `，并停止 ${killedJobs} 个后台任务`
+    const warning = workspaceResult?.warning === undefined ? '' : ` ${workspaceResult.warning}`
     return {
-      status: 'rolled_back',
-      shadowedCount: range.shadowedSeqs.length,
-      markerSeq,
-      turn: range.turn,
-      step: range.step,
-      note: rolledBackNote(range, range.shadowedSeqs.length),
+      kind: 'success',
+      text: target === undefined
+        ? `已撤销从用户消息 ${range.userSeq} 开始的 ${range.shadowedSeqs.length} 条上下文消息${workspaceText}${jobsText}；输入 /redo 可恢复。${warning}`
+        : `已回退至 "${target}"${workspaceText}${jobsText}；输入 /redo 可恢复。${warning}`,
     }
   }
 
-  /**
-   * Restore the most recently undone step by re-appending fresh copies of its
-   * shadowed messages.
-   * @param signal - caller cancellation; observed at operation boundaries.
-   * @returns the closed canonical value.
-   */
-  async redo(signal: AbortSignal): Promise<RedoResult> {
-    if (signal.aborted) {
-      return { status: 'internal_error', message: 'The redo call was cancelled before it ran.' }
-    }
-    const entry = this.redoStack[this.redoStack.length - 1]
-    if (entry === undefined) return { status: 'nothing_to_redo' }
+  async redo(signal: AbortSignal): Promise<CommandResult> {
+    if (signal.aborted) return { kind: 'error', text: CANCELLED_TEXT }
     try {
-      await flushUndoPersistence(this.rootCtx, this.agent.session)
-    } catch {
-      return { status: 'persistence_uncertain', message: PERSISTENCE_UNCERTAIN_MESSAGE }
-    }
-    if (signal.aborted) {
-      return { status: 'internal_error', message: 'The redo call was cancelled before it committed.' }
-    }
-    let restoredCount: number
-    try {
-      restoredCount = appendRedoCopies(this.agent.session, entry.shadowedSeqs)
+      return await this.agent.runMaintenance(maintenanceSignal => this.redoIdle(signal, maintenanceSignal))
     } catch (error: unknown) {
-      this.rootCtx.logger.warn(`undo: redo append failed: ${error instanceof Error ? error.message : String(error)}`)
-      return { status: 'internal_error', message: INTERNAL_ERROR_MESSAGE }
+      this.rootCtx.logger.warn(`redo: maintenance failed: ${error instanceof Error ? error.message : String(error)}`)
+      return { kind: 'error', text: BUSY_TEXT }
     }
-    // The copies are already in the session; pop so a retry cannot duplicate
-    // them, then confirm durability.
-    this.redoStack.pop()
+  }
+
+  private async redoIdle(signal: AbortSignal, maintenanceSignal: AbortSignal): Promise<CommandResult> {
+    if (signal.aborted || maintenanceSignal.aborted) return { kind: 'error', text: CANCELLED_TEXT }
+    if (!supportsSurfaceRewind(this.agent.session)) return { kind: 'error', text: UNSUPPORTED_TEXT }
     try {
       await flushUndoPersistence(this.rootCtx, this.agent.session)
+      await this.workspace?.reconcile()
     } catch {
-      return { status: 'persistence_uncertain', message: PERSISTENCE_UNCERTAIN_MESSAGE }
+      return { kind: 'error', text: PERSISTENCE_UNCERTAIN_TEXT }
     }
-    return { status: 'restored', restoredCount, note: restoredNote(restoredCount) }
+    const rewindSeq = activeRewindSeqs(this.agent.session).at(-1)
+    if (rewindSeq === undefined) return { kind: 'success', text: '没有可重做的内容：已是最新状态。' }
+    if (signal.aborted || maintenanceSignal.aborted) return { kind: 'error', text: CANCELLED_TEXT }
+    let workspaceResult: Awaited<ReturnType<WorkspaceUndoTracker['redo']>> | undefined
+    try {
+      workspaceResult = await this.workspace?.redo(rewindSeq)
+      appendSurfaceRestore(this.agent.session, rewindSeq)
+    } catch (error: unknown) {
+      try {
+        await this.workspace?.rollbackRedo(rewindSeq)
+      } catch (rollbackError: unknown) {
+        this.rootCtx.logger.warn(`redo: workspace compensation failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`)
+      }
+      this.rootCtx.logger.warn(`redo: surface restore failed: ${error instanceof Error ? error.message : String(error)}`)
+      return { kind: 'error', text: INTERNAL_ERROR_TEXT }
+    }
+    try {
+      await flushUndoPersistence(this.rootCtx, this.agent.session)
+      await this.workspace?.commitRedo(rewindSeq)
+    } catch {
+      return { kind: 'error', text: PERSISTENCE_UNCERTAIN_TEXT }
+    }
+    const workspaceText = workspaceResult?.files === undefined || workspaceResult.files === 0
+      ? ''
+      : `，并恢复 ${workspaceResult.files} 个工作树文件`
+    return { kind: 'success', text: `已恢复最近撤销的模型上下文${workspaceText}；输入 /undo 可再次回滚。` }
   }
 }

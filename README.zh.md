@@ -1,28 +1,48 @@
 # dsh-undo
 
-面向 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（`dsh`）的上下文撤销/重做插件，灵感来自 [opencode](https://github.com/anomalyco/opencode) 等编码 agent 的 undo/redo 体验。
+> [!WARNING]
+> **超前预览：本版本无法在任何当前已发布的 DeepSeek Harness 版本中使用。** 它依赖尚未发布的 Harness 持久化 `surface/rewind` / `surface/restore` 事件和 `conversation.chat.user-actions` WebUI slot。现在安装后，`/undo` 会安全拒绝并提示升级。本包当前仅用于预览和协调未来集成；在配套 Harness 正式发布前，不应视为可用于生产环境。
 
-插件为每个根 agent 提供两个面向模型的工具：
+面向 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（`dsh`）的持久化多级撤销/重做插件。它按真实用户轮次回退模型上下文，并恢复该轮工具修改的工作树文件。
 
-- **`undo`** — 把模型上下文回滚到最近一个已完成步骤的末尾。该步骤的所有 assistant 消息与工具结果都会从可见上下文中隐去；持久化的会话日志仍保留全部被回滚的事件，数据不会丢失。
-- **`redo`** — 把最近一次 `undo` 移除的消息重新加回上下文，恢复原状。
+命令只在本地处理，绝不发送给模型：
+
+- **`/undo`** 撤销当前可见的最后一条真实用户消息及其后的全部 surface 消息。
+- **`/undo <user-seq>`** 从指定的可见用户消息开始撤销，同时移除其后的所有轮次。
+- **`/redo`** 恢复最近一次仍有效的撤销。连续 undo/redo 按 LIFO 顺序执行。
+
+WebUI Client 会在已完成的真实用户消息气泡上添加撤销按钮。按钮调用 `/undo <user-seq>`；Host 负责验证该消息当前是否仍是合法的回退目标。
 
 ## 工作原理
 
-会话日志是只追加的，因此 `undo` 从不删除事件，而是追加一条**内容为空的 `assistant/message`**，用其 surface `replace` 操作遮蔽目标步骤的模型可见节点。空的 assistant 内容不会派生任何消息，因此模型看到的上下文恰好等于步骤之前的状态，而日志始终是一份完整、可重放、可逆的历史。`redo` 则把被遮蔽的事件以全新副本重新追加为普通 surface append（消息身份重新生成；工具结果保留调用关联，因此对话中 tool-call → tool-result 的相邻关系保持不变）。
+Harness 会话日志保持只追加。undo 为当前 surface 的精确连续后缀追加专用 `surface/rewind` 控制事件；redo 为最新 active rewind 追加 `surface/restore`。原消息节点、消息 ID、工具调用关联和日志事件均不改变。进程重启后，Session replay 会重建相同的可见 surface 与 redo 栈。
 
-设计要点：
+每次顶层工具执行前后，插件使用 `~/.dsh/dsh-undo/snapshots/` 下按会话隔离的隐藏 Git 目录记录工作树。它不会创建 commit、切换 branch，也不会修改仓库自己的 Git index。undo 只恢复所选用户轮次中工具实际触及的文件；redo 恢复 undo 前的工作树。patch 和 redo 元数据按会话保存，因此文件 redo 可跨 Host 重启继续使用。
 
-- **撤销单位是一个已完成的步骤**（最新一条 `step/end` 且该步骤仍有可见消息）。连续调用 `undo` 会一步一步往回走。
-- **用户消息永不回滚** — 用户提示始终留在上下文中，可撤销的只是针对它的 assistant 工作。
-- **新用户输入会使 redo 失效** — 任何新的 user-role 消息都会清空 redo 栈（标准的撤销/重做语义）。undo/redo 工具自身的调用、结果和 redo 副本不会使其失效。
-- **持久化** — 每次操作在报告成功前都会经过共享的会话持久化屏障（`ctx.sessions.flush`）；无法证明持久化完成时返回 `persistence_uncertain`，而不是谎报成功。
-- **撤销历史是进程内的** — 与浏览器的撤销栈一样，redo 栈只存在内存中。重启进程后日志保持一致（标记保持遮蔽、副本保持恢复），但 redo 栈会被清空。
-- **作用范围** — 只为插件加载后发布的根 agent 安装（子 agent 与既有会话不会被动补装）。
+工作树跟踪包含 tracked 文件和不超过 2 MiB 的未跟踪文件。仓库忽略的文件和更大的未跟踪文件保持不变。小型两阶段 journal 会在重启后依据持久化的 active-rewind 栈对账未完成的文件操作。若会话不在 Git 工作区内，上下文 undo/redo 仍然可用，命令会提示无法恢复文件。
+
+顶层工具返回的后台任务会关联到对应用户轮次。undo 会请求停止被移除轮次启动的任务。redo 只恢复上下文和文件，不能重新启动已终止的进程。
+
+## 要求
+
+插件要求 Harness 提供：
+
+- 持久化的 `surface/rewind` 和 `surface/restore` Session 事件。
+- 用于 WebUI 消息按钮的 `conversation.chat.user-actions` Client slot。
+
+旧版 Harness 会安全拒绝：`/undo` 会提示升级，而不会写入伪造的 assistant 替换消息或复制 transcript 事件。
+
+## 限制
+
+- 文件恢复只覆盖检测到的 Git 工作区，绝不会恢复该目录之外的文件。
+- 网络请求、数据库写入、远程 API 调用、已退出进程及其他外部副作用无法撤销。
+- 经嵌套工具派发或子 Agent 启动的后台任务可能无法关联到根用户轮次。
+- undo 会向已记录的顶层后台任务发送停止请求，但不会无限等待进程退出。
+- 新的普通 surface 输出会按 Harness surface 语义使当前 redo 历史失效。
 
 ## 安装
 
-本包是 [dsh 组合包](https://deepseek-harness.github.io/deepseek-harness/develop/basic/publish/)：`package.json` 声明了 `dsh.bundle`，指向 `cordis.patch.yml`，该 patch 会激活插件行。
+本包是 [dsh 组合包](https://deepseek-harness.github.io/deepseek-harness/develop/basic/publish/)。`package.json` 通过 `dsh.bundle` 指向 `cordis.patch.yml` 以启用 Host 插件，同时导出 WebUI Client bundle。
 
 从 npm 安装：
 
@@ -30,19 +50,17 @@
 dsh plugin --profile demo add dsh-undo
 ```
 
-从 git 安装（源码检出——`prepare` 脚本会在安装时构建 `lib/`；需先在 profile 的 `pnpm-workspace.yaml` 中授权构建）：
+从 git 安装（`prepare` 脚本会在安装时构建 `lib/`；需先在 profile 的 `pnpm-workspace.yaml` 中授权构建）：
 
 ```sh
 dsh plugin --profile demo add github:LingLambda/dsh-undo#<sha>
 ```
 
-针对 deepseek-harness 源码检出做本地开发时，可直接以 overlay 方式加载插件：
+针对 Harness 源码检出做本地开发时，可通过 overlay 加载 Host 源码：
 
 ```sh
 pnpm dsh web --patch ./cordis.patch.yml --patch /absolute/path/to/dsh-undo/overlay.yml
 ```
-
-其中 `overlay.yml` 引用源码入口：
 
 ```yaml
 - insert:
@@ -52,21 +70,21 @@ pnpm dsh web --patch ./cordis.patch.yml --patch /absolute/path/to/dsh-undo/overl
 
 ## 用法
 
-当你说“撤销/回滚刚才的操作”时，模型会调用 `undo`；说“重做/恢复被撤销的内容”时调用 `redo`：
-
+```text
+/undo
+/undo 42
+/redo
 ```
-> 那个修改是错的。撤销它，换一种方式重试。
-```
 
-每次调用都会在结果中说明发生了什么（`rolled_back` 并附被遮蔽数量与标记 seq、`restored`、`nothing_to_undo`、`nothing_to_redo`，或错误）。
+使用 `/undo` 撤销最近用户轮次；点击较早用户消息上的按钮可从该处回退；使用 `/redo` 恢复最近一次撤销。
 
 ## 开发
 
 ```sh
-yarn install
-yarn typecheck
-yarn test
-yarn build
+corepack yarn install
+corepack yarn typecheck
+corepack yarn test
+corepack yarn build
 ```
 
 ## License
