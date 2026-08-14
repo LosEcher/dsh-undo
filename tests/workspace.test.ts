@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process'
-import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
@@ -204,6 +204,26 @@ describe('WorkspaceUndoTracker', () => {
     expect(await readFile(file, 'utf8')).toBe('before\n')
     expect(await readFile(ignored, 'utf8')).toBe('ignored\n')
     expect((await readFile(large)).byteLength).toBe(2 * 1024 * 1024 + 1)
+  })
+
+  it('does not fail when the repo tracks files that .gitignore ignores (explicit ignored pathspec)', async () => {
+    const { root, file, userSeq, tracker, exec } = await fixture()
+    const icon = join(root, 'src-tauri', 'icons', '128x128.png')
+    await mkdir(join(root, 'src-tauri', 'icons'), { recursive: true })
+    await writeFile(icon, 'icon-before\n')
+    await writeFile(join(root, '.gitignore'), '*.png\n')
+    await execFileAsync('git', ['-C', root, 'add', '-f', 'src-tauri/icons/128x128.png'])
+
+    await expect(tracker.around(exec, async () => {
+      await writeFile(file, 'after\n')
+      await writeFile(icon, 'icon-after\n')
+      return success
+    })).resolves.toEqual(success)
+
+    // tracked files still round-trip through undo; ignored files stay excluded
+    expect((await tracker.undo([userSeq], 106)).files).toBe(1)
+    expect(await readFile(file, 'utf8')).toBe('before\n')
+    expect(await readFile(icon, 'utf8')).toBe('icon-after\n')
   })
 
   it('does not restore a captured file after it becomes ignored', async () => {

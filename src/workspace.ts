@@ -83,7 +83,14 @@ export class WorkspaceUndoTracker {
   ): Promise<ToolExecutionResult> {
     if (exec.parent !== undefined) return next()
     const userSeq = this.userSeqForCall(String(exec.rootCallId))
-    const before = userSeq === undefined ? undefined : await this.snapshot()
+    let before: string | undefined
+    if (userSeq !== undefined) {
+      try {
+        before = await this.snapshot()
+      } catch (error: unknown) {
+        this.ctx.logger.warn(`undo: pre-checkpoint failed, undo degraded for this turn: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
     let result: ToolExecutionResult | undefined
     try {
       result = await next()
@@ -343,7 +350,7 @@ export class WorkspaceUndoTracker {
       }
       const candidates = [...new Set([...tracked, ...allowedUntracked])]
       for (const batch of this.pathBatches(candidates)) {
-        await this.git(['add', '--all', '--', ...batch.map(file => `:(top,literal)${file}`)])
+        await this.git(['add', '-f', '--all', '--', ...batch.map(file => `:(top,literal)${file}`)])
       }
       const candidateSet = new Set(candidates)
       const hiddenFiles = this.splitPaths(await this.git(['ls-files', '-z']))
