@@ -8,6 +8,7 @@ import {
   appendSurfaceRestore,
   appendSurfaceRewind,
   computeUndoRange,
+  eventAt,
   lastVisibleText,
   supportsSurfaceRewind,
   turnForAssistantMessage,
@@ -118,7 +119,7 @@ export class UndoRuntime {
     const rewindSeq = this.agent.session.seq
     try {
       const userSeqs = range.shadowedSeqs.filter((seq) => {
-        const event = this.agent.session.events[seq]
+        const event = eventAt(this.agent.session, seq)
         return event?.type === 'user/message' && event.data.source.kind === 'user'
       })
       workspaceResult = await this.workspace?.undo(userSeqs, rewindSeq)

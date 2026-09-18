@@ -22,6 +22,52 @@ export interface LastVisibleMessage {
   readonly turn: number | undefined
 }
 
+/**
+ * Read one durable event by sequence.
+ *
+ * Harness 0.1.0-rc.x exposed `Session.events`; 0.1.5-rc.x removed it in favour of
+ * `eventAt()`/`snapshotEvents()` (both deprecated in turn — see
+ * `.agents/notes/implemented/architecture/2026-09-09-deprecate-synchronous-session-event-reads.md`).
+ * This plugin declares an older `dsh-session`, so it probes for whichever
+ * accessor the running harness actually has instead of assuming one.
+ *
+ * Migration is deferred, not accepted: both readers are deprecated synchronous
+ * history reads and the sanctioned shape is a Session projection.
+ */
+export function eventAt(session: Session, seq: number): SessionEvent | undefined {
+  const probe = session as unknown as {
+    eventAt?: (seq: number) => SessionEvent | undefined
+    events?: readonly (SessionEvent | undefined)[]
+  }
+  if (typeof probe.eventAt === 'function') return probe.eventAt(seq)
+  return probe.events?.[seq]
+}
+
+/** The number of durable events this Session's log holds. */
+export function eventCount(session: Session): number {
+  const probe = session as unknown as {
+    seq?: number
+    events?: readonly unknown[]
+  }
+  if (typeof probe.seq === 'number') return probe.seq
+  return probe.events?.length ?? 0
+}
+
+/**
+ * The Session log as a positional list, under whichever accessor the running
+ * harness has. The current harness materializes it per call (O(events)); that
+ * cost is bounded by one call per undo command and disappears with the
+ * projection migration noted on {@link eventAt}.
+ */
+export function sessionEvents(session: Session): readonly (SessionEvent | undefined)[] {
+  const probe = session as unknown as { events?: readonly SessionEvent[] }
+  if (Array.isArray(probe.events)) return probe.events
+  const length = eventCount(session)
+  const out: (SessionEvent | undefined)[] = new Array(length)
+  for (let seq = 0; seq < length; seq++) out[seq] = eventAt(session, seq)
+  return out
+}
+
 /** New Harness surface-control capability required by this plugin. */
 interface RewindSurface {
   readonly nodes: readonly number[]
@@ -42,7 +88,7 @@ export function activeRewindSeqs(session: Session): readonly number[] {
 /** Locate the newest visible model message. */
 export function lastVisibleMessage(session: Session): LastVisibleMessage | undefined {
   const nodes = session.surface.nodes
-  const events = session.events
+  const events = sessionEvents(session)
   for (let index = nodes.length - 1; index >= 0; index--) {
     const seq = nodes[index]
     if (seq === undefined) continue
@@ -66,7 +112,7 @@ export function lastVisibleMessage(session: Session): LastVisibleMessage | undef
  */
 export function computeUndoRange(session: Session, targetUserSeq?: number): UndoRange | undefined {
   const nodes = session.surface.nodes
-  const events = session.events
+  const events = sessionEvents(session)
   let userIndex = -1
   for (let index = nodes.length - 1; index >= 0; index--) {
     const seq = nodes[index]
@@ -92,7 +138,7 @@ export function computeUndoRange(session: Session, targetUserSeq?: number): Undo
  */
 export function userSeqForTurn(session: Session, turn: number): number | undefined {
   const nodes = session.surface.nodes
-  const events = session.events
+  const events = sessionEvents(session)
   let start = -1
   for (let seq = 0; seq < events.length; seq++) {
     const event = events[seq]
@@ -120,7 +166,7 @@ export function userSeqForTurn(session: Session, turn: number): number | undefin
 
 /** Locate the Turn that produced one durable assistant message id. */
 export function turnForAssistantMessage(session: Session, messageId: string): number | undefined {
-  const events = session.events
+  const events = sessionEvents(session)
   for (let seq = 0; seq < events.length; seq++) {
     const event = events[seq]
     if (event?.type === 'assistant/message' && event.data.message.id === messageId) {
@@ -158,7 +204,7 @@ export function lastVisibleText(session: Session, max = 30): string | undefined 
   for (let index = nodes.length - 1; index >= 0; index--) {
     const seq = nodes[index]
     if (seq === undefined) continue
-    const event = session.events[seq]
+    const event = eventAt(session, seq)
     if (event?.type !== 'user/message' || event.data.source.kind !== 'user') continue
     const message = session.deriveEventMessage(event)
     if (message === null) continue

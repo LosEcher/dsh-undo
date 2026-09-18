@@ -9,6 +9,7 @@ import { promisify } from 'node:util'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { ToolDispatchExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
+import { sessionEvents } from './domain.ts'
 
 const execFileAsync = promisify(execFile)
 const MAX_UNTRACKED_BYTES = 2 * 1024 * 1024
@@ -282,8 +283,8 @@ export class WorkspaceUndoTracker {
   }
 
   private userSeqForCall(callId: string): number | undefined {
-    const events = this.agent.session.events
-    const callIndex = events.findIndex(event => event.type === 'tool/call' && String(event.data.callId) === callId)
+    const events = sessionEvents(this.agent.session)
+    const callIndex = events.findIndex(event => event?.type === 'tool/call' && String(event.data.callId) === callId)
     if (callIndex < 0) return undefined
     for (let index = callIndex - 1; index >= 0; index--) {
       const event = events[index]
@@ -294,8 +295,8 @@ export class WorkspaceUndoTracker {
   }
 
   private callSeq(callId: string): number | undefined {
-    return this.agent.session.events.find(event =>
-      event.type === 'tool/call' && String(event.data.callId) === callId)?.seq
+    return sessionEvents(this.agent.session).find(event =>
+      event?.type === 'tool/call' && String(event.data.callId) === callId)?.seq
   }
 
   private async initialize(): Promise<boolean> {
