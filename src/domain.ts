@@ -83,6 +83,53 @@ export function computeUndoRange(session: Session, targetUserSeq?: number): Undo
   return { userSeq, shadowedSeqs: nodes.slice(userIndex) }
 }
 
+/**
+ * Locate the real user message that opened a numbered Turn. The Turn boundary
+ * is `turn/start`; the message the loop appended for that prompt follows it and
+ * precedes the matching `turn/end`, so the scan is bounded on both sides and a
+ * later Turn's prompt can never be mistaken for this one's. A Turn whose prompt
+ * left the surface (already undone, or compacted away) resolves to `undefined`.
+ */
+export function userSeqForTurn(session: Session, turn: number): number | undefined {
+  const nodes = session.surface.nodes
+  const events = session.events
+  let start = -1
+  for (let seq = 0; seq < events.length; seq++) {
+    const event = events[seq]
+    if (event?.type === 'turn/start' && event.data.turn === turn) {
+      start = seq
+      break
+    }
+  }
+  if (start < 0) return undefined
+  let end = events.length
+  for (let seq = start + 1; seq < events.length; seq++) {
+    const event = events[seq]
+    if (event?.type === 'turn/end' && event.data.turn === turn) {
+      end = seq
+      break
+    }
+  }
+  for (const seq of nodes) {
+    if (seq < start || seq >= end) continue
+    const event = events[seq]
+    if (event?.type === 'user/message' && event.data.source.kind === 'user') return seq
+  }
+  return undefined
+}
+
+/** Locate the Turn that produced one durable assistant message id. */
+export function turnForAssistantMessage(session: Session, messageId: string): number | undefined {
+  const events = session.events
+  for (let seq = 0; seq < events.length; seq++) {
+    const event = events[seq]
+    if (event?.type === 'assistant/message' && event.data.message.id === messageId) {
+      return event.data.turn
+    }
+  }
+  return undefined
+}
+
 /** Append a durable suffix rewind and return its control event. */
 export function appendSurfaceRewind(
   session: Session,

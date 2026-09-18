@@ -1,9 +1,10 @@
-/** Browser half: undo action contributed to each finalized real user message. */
+/** Browser half: undo action contributed to each finalized assistant message. */
 
 import { useEffect, useState, type CSSProperties, type ReactNode } from 'react'
 import { IconRefreshOutline16, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
 
 type SessionId = string
+type MessageId = string
 
 interface RemoteResult {
   readonly ok: boolean
@@ -19,7 +20,7 @@ interface UndoClientContext {
         name: string
         id: string
         order: number
-        inject(sessionId: SessionId): UndoActionInjected
+        inject(): UndoActionInjected
       },
       component: (props: UndoActionProps) => ReactNode,
     ): () => void
@@ -32,11 +33,13 @@ interface UndoClientContext {
 }
 
 interface UndoActionInjected {
-  undo(seq: number): Promise<string | null>
+  undo(sessionId: SessionId, messageId: MessageId): Promise<string | null>
 }
 
+/** Owner share (`messageId`) plus the session-scoped standard kit. */
 interface UndoActionProps extends UndoActionInjected {
-  readonly seq: number
+  readonly messageId: MessageId
+  readonly sessionId: SessionId
 }
 
 const actionStyle: CSSProperties = {
@@ -53,17 +56,15 @@ const actionStyle: CSSProperties = {
   cursor: 'pointer',
 }
 
-/** Native message-strip action that rewinds from the addressed user message. */
-function UndoUserAction({ seq, undo }: UndoActionProps): ReactNode {
+/** Native message-strip action that rewinds from the turn behind this answer. */
+function UndoAssistantAction({ messageId, sessionId, undo }: UndoActionProps): ReactNode {
   const [pending, setPending] = useState(false)
   const [failure, setFailure] = useState<string | null>(null)
-  const label = failure ?? 'Undo from this message'
-
+  const label = failure ?? 'Undo this turn'
   useEffect(() => {
     setFailure(null)
     setPending(false)
-  }, [seq])
-
+  }, [messageId])
   return (
     <Tooltip label={label} side="bottom">
       <button
@@ -76,7 +77,7 @@ function UndoUserAction({ seq, undo }: UndoActionProps): ReactNode {
           if (pending) return
           setPending(true)
           setFailure(null)
-          void undo(seq).then((error) => {
+          void undo(sessionId, messageId).then((error) => {
             setPending(false)
             setFailure(error)
           })
@@ -91,19 +92,24 @@ function UndoUserAction({ seq, undo }: UndoActionProps): ReactNode {
 /** Services required by the browser half. */
 export const inject = ['slots', 'remote', 'remote.commands']
 
-/** Register one action entry in the user-message action slot. */
+/**
+ * Register one entry in the finalized assistant message's action list. The
+ * action addresses the turn by the durable assistant message id, because the
+ * model-facing surface exposes message identity rather than the user-message
+ * seq the host command rewinds from.
+ */
 export function apply(ctx: UndoClientContext): void {
-  ctx.slots.inject('conversation.chat.user-actions', () => ctx.slots.register({
-    name: 'conversation.chat.user-actions',
+  ctx.slots.inject('conversation.chat.assistant-actions', () => ctx.slots.register({
+    name: 'conversation.chat.assistant-actions',
     id: 'undo',
     order: 10,
-    inject: (sessionId): UndoActionInjected => ({
-      undo: async (seq) => {
-        const result = await ctx.remote.commands.execute(sessionId, `/undo ${seq}`)
+    inject: (): UndoActionInjected => ({
+      undo: async (sessionId, messageId) => {
+        const result = await ctx.remote.commands.execute(sessionId, `/undo message:${messageId}`)
         if (!result.ok) return `${result.error?.message ?? 'command failed'}${result.error?.code === undefined ? '' : ` (${result.error.code})`}`
         if (result.value === undefined) return 'Undo command is unavailable'
         return null
       },
     }),
-  }, UndoUserAction))
+  }, UndoAssistantAction))
 }

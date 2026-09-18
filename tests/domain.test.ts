@@ -9,6 +9,8 @@ import {
   lastVisibleMessage,
   lastVisibleText,
   supportsSurfaceRewind,
+  turnForAssistantMessage,
+  userSeqForTurn,
 } from '../src/domain.ts'
 
 function user(session: Session, text: string, kind: 'user' | 'plugin' = 'user'): number {
@@ -110,5 +112,66 @@ describe('visible message helpers', () => {
       turn: 1,
     })
     expect(lastVisibleText(session, 10)).toBe(`${'a'.repeat(10)}…`)
+  })
+})
+
+describe('turn and message anchors', () => {
+  /** Open a numbered Turn boundary the way the loop does, around its prompt. */
+  function turn(session: Session, n: number, prompt: string, answer: string): { userSeq: number; messageId: string } {
+    session.append('turn/start', { turn: n })
+    const userSeq = user(session, prompt)
+    const seq = assistant(session, answer, n)
+    session.append('turn/end', { turn: n, reason: { kind: 'completed' } })
+    const event = session.events[seq]
+    if (event?.type !== 'assistant/message') throw new Error('fixture: expected assistant message')
+    return { userSeq, messageId: event.data.message.id }
+  }
+
+  it('anchors a Turn on the prompt between its own boundaries', () => {
+    const session = Session.create(SessionId('anchor'))
+    const first = turn(session, 1, 'first', 'one')
+    const second = turn(session, 2, 'second', 'two')
+
+    expect(userSeqForTurn(session, 1)).toBe(first.userSeq)
+    expect(userSeqForTurn(session, 2)).toBe(second.userSeq)
+    expect(computeUndoRange(session, userSeqForTurn(session, 1))).toEqual({
+      userSeq: first.userSeq,
+      shadowedSeqs: [first.userSeq, first.userSeq + 1, second.userSeq, second.userSeq + 1],
+    })
+  })
+
+  it('never borrows a later Turn prompt for a Turn that has none', () => {
+    const session = Session.create(SessionId('empty-turn'))
+    session.append('turn/start', { turn: 1 })
+    session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+    const second = turn(session, 2, 'second', 'two')
+
+    expect(userSeqForTurn(session, 1)).toBeUndefined()
+    expect(userSeqForTurn(session, 2)).toBe(second.userSeq)
+    expect(userSeqForTurn(session, 99)).toBeUndefined()
+  })
+
+  it('resolves the Turn behind a durable assistant message id', () => {
+    const session = Session.create(SessionId('message-turn'))
+    const first = turn(session, 1, 'first', 'one')
+    const second = turn(session, 2, 'second', 'two')
+
+    expect(turnForAssistantMessage(session, second.messageId)).toBe(2)
+    expect(turnForAssistantMessage(session, first.messageId)).toBe(1)
+    expect(turnForAssistantMessage(session, 'missing')).toBeUndefined()
+  })
+
+  it('never borrows a real prompt that sits outside the Turn boundaries', () => {
+    const session = Session.create(SessionId('outside-turn'))
+    const stray = user(session, 'earlier prompt')
+    session.append('turn/start', { turn: 1 })
+    session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+    const second = turn(session, 2, 'second', 'two')
+
+    // Turn 1 opened and closed with no prompt of its own: the earlier real user
+    // message is outside its boundaries and must not become its anchor.
+    expect(userSeqForTurn(session, 1)).toBeUndefined()
+    expect(userSeqForTurn(session, 2)).toBe(second.userSeq)
+    expect(stray).toBeLessThan(second.userSeq)
   })
 })

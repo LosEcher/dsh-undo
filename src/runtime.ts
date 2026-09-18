@@ -10,6 +10,8 @@ import {
   computeUndoRange,
   lastVisibleText,
   supportsSurfaceRewind,
+  turnForAssistantMessage,
+  userSeqForTurn,
 } from './domain.ts'
 import { flushUndoPersistence } from './persistence.ts'
 import type { WorkspaceUndoTracker } from './workspace.ts'
@@ -22,6 +24,18 @@ export const BUSY_TEXT = '当前会话正在处理其他操作；请在其完成
 export const UNSUPPORTED_TEXT =
   '当前 Harness 不支持安全的会话回退；请升级到包含 surface rewind/restore 的版本。'
 
+/** What one `undo` invocation targets. */
+export type UndoTarget =
+  | { readonly kind: 'latest' }
+  | { readonly kind: 'user-seq'; readonly seq: number }
+  | { readonly kind: 'turn'; readonly turn: number }
+  | { readonly kind: 'message'; readonly messageId: string }
+
+/** Resolved anchor for {@link computeUndoRange}, or the reason it cannot be resolved. */
+type ResolvedTarget =
+  | { readonly seq: number | undefined }
+  | { readonly failure: string }
+
 /** One live root agent's undo/redo operations. */
 export class UndoRuntime {
   constructor(
@@ -30,21 +44,53 @@ export class UndoRuntime {
     private readonly workspace?: WorkspaceUndoTracker,
   ) {}
 
-  async undo(signal: AbortSignal, targetUserSeq?: number): Promise<CommandResult> {
+  async undo(signal: AbortSignal, target: UndoTarget = { kind: 'latest' }): Promise<CommandResult> {
     if (signal.aborted) return { kind: 'error', text: CANCELLED_TEXT }
     try {
       return await this.agent.runMaintenance(maintenanceSignal =>
-        this.undoIdle(signal, maintenanceSignal, targetUserSeq))
+        this.undoIdle(signal, maintenanceSignal, target))
     } catch (error: unknown) {
       this.rootCtx.logger.warn(`undo: maintenance failed: ${error instanceof Error ? error.message : String(error)}`)
       return { kind: 'error', text: BUSY_TEXT }
     }
   }
 
+  /**
+   * Resolve one UI-facing target into the user-message seq `computeUndoRange`
+   * anchors on. Both the Turn and the assistant-message form exist because the
+   * model-facing surface exposes Turn identity and durable message ids, never
+   * the raw user-message seq an older UI action used to send.
+   */
+  private resolveTarget(target: UndoTarget): ResolvedTarget {
+    const session = this.agent.session
+    switch (target.kind) {
+      case 'latest':
+        return { seq: undefined }
+      case 'user-seq':
+        return { seq: target.seq }
+      case 'turn': {
+        const seq = userSeqForTurn(session, target.turn)
+        return seq === undefined
+          ? { failure: `无法撤销轮次 ${target.turn}：它没有仍在当前上下文中的用户消息。` }
+          : { seq }
+      }
+      case 'message': {
+        const turn = turnForAssistantMessage(session, target.messageId)
+        if (turn === undefined) {
+          return { failure: `无法撤销消息 ${target.messageId}：找不到它所属的轮次。` }
+        }
+        const seq = userSeqForTurn(session, turn)
+        return seq === undefined
+          ? { failure: `无法撤销轮次 ${turn}：它没有仍在当前上下文中的用户消息。` }
+          : { seq }
+      }
+    }
+  }
+
   private async undoIdle(
     signal: AbortSignal,
     maintenanceSignal: AbortSignal,
-    targetUserSeq?: number,
+    target: UndoTarget,
   ): Promise<CommandResult> {
     if (signal.aborted || maintenanceSignal.aborted) return { kind: 'error', text: CANCELLED_TEXT }
     if (!supportsSurfaceRewind(this.agent.session)) return { kind: 'error', text: UNSUPPORTED_TEXT }
@@ -54,6 +100,9 @@ export class UndoRuntime {
     } catch {
       return { kind: 'error', text: PERSISTENCE_UNCERTAIN_TEXT }
     }
+    const resolved = this.resolveTarget(target)
+    if ('failure' in resolved) return { kind: 'error', text: resolved.failure }
+    const targetUserSeq = resolved.seq
     const range = computeUndoRange(this.agent.session, targetUserSeq)
     if (range === undefined) {
       return {
@@ -90,7 +139,7 @@ export class UndoRuntime {
     } catch {
       return { kind: 'error', text: PERSISTENCE_UNCERTAIN_TEXT }
     }
-    const target = lastVisibleText(this.agent.session)
+    const preview = lastVisibleText(this.agent.session)
     const workspaceText = workspaceResult?.files === undefined || workspaceResult.files === 0
       ? ''
       : `，并恢复 ${workspaceResult.files} 个工作树文件`
@@ -98,9 +147,9 @@ export class UndoRuntime {
     const warning = workspaceResult?.warning === undefined ? '' : ` ${workspaceResult.warning}`
     return {
       kind: 'success',
-      text: target === undefined
+      text: preview === undefined
         ? `已撤销从用户消息 ${range.userSeq} 开始的 ${range.shadowedSeqs.length} 条上下文消息${workspaceText}${jobsText}；输入 /redo 可恢复。${warning}`
-        : `已回退至 "${target}"${workspaceText}${jobsText}；输入 /redo 可恢复。${warning}`,
+        : `已回退至 "${preview}"${workspaceText}${jobsText}；输入 /redo 可恢复。${warning}`,
     }
   }
 
